@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[oc]
+*.egg-info
+build/
+dist/
+
+# Virtual envs
+.venv/
+
+# OS / editor cruft
+.DS_Store
+**/.DS_Store
+.idea/
+.vscode/
+
+# Local run artifacts
+run.log
+overnight.log
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Cached data (downloaded by prepare.py)
+.cache/
