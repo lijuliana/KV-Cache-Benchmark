@@ -1,0 +1,1616 @@
+"""
+KV-cache compression: substrate training + compressor eval. Single-GPU, single-file.
+Cherry-picked and simplified from nanochat.
+Usage: uv run train.py
+"""
+
+import os
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+
+import gc
+import time
+from dataclasses import dataclass, asdict
+
+import sys
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+def verify_env():
+    """Accept CUDA (Linux/Windows GPU), MPS (Apple Silicon), or CPU as a last resort.
+
+    Returns the device string that was selected.
+    """
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        print(f"Environment verified: CUDA detected — {gpu_name} ({vram_gb:.1f} GB VRAM).")
+        print()
+        return "cuda"
+    # mps may not exist on Linux torch builds — guard the attribute lookup
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        print("Environment verified: macOS / Apple Silicon (MPS) hardware acceleration available.")
+        print()
+        return "mps"
+    print("WARNING: no CUDA or MPS device found — falling back to CPU. "
+          "Training will be very slow; training on CPU is impractical for the substrate sizes used here.")
+    print()
+    return "cpu"
+
+DEVICE_TYPE = verify_env()
+
+from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+
+# ---------------------------------------------------------------------------
+# GPT Model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GPTConfig:
+    sequence_len: int = 2048
+    vocab_size: int = 32768
+    n_layer: int = 12
+    n_head: int = 6
+    n_kv_head: int = 6
+    n_embd: int = 768
+    window_pattern: str = "SSSL"
+
+
+def norm(x):
+    return F.rms_norm(x, (x.size(-1),))
+
+
+def has_ve(layer_idx, n_layer):
+    """Returns True if layer should have Value Embedding (alternating, last always included)."""
+    return layer_idx % 2 == (n_layer - 1) % 2
+
+
+def apply_rotary_emb(x, cos, sin):
+    assert x.ndim == 4
+    d = x.shape[3] // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return torch.cat([y1, y2], 3)
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
+        assert self.n_embd % self.n_head == 0
+        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
+        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.ve_gate_channels = 32
+        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+
+    def forward(self, x, ve, cos_sin, window_size):
+        B, T, C = x.size()
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+
+        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
+        if ve is not None:
+            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
+            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
+            v = v + gate.unsqueeze(-1) * ve
+
+        cos, sin = cos_sin
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q, k = norm(q), norm(k)
+
+        # PyTorch SDPA without FlashAttention 3
+        # Expand heads for KV based on GQA
+        k = k.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
+        v = v.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
+        
+        # Transpose to [B, H, T, D]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # Apply mask for sliding window
+        window = window_size[0]
+        if window > 0 and window < T:
+            # Mask out tokens outside the window
+            mask = torch.ones(T, T, dtype=torch.bool, device=q.device).tril()
+            mask = mask.triu(diagonal=1 - window)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            
+        y = y.transpose(1, 2).contiguous().view(B, T, -1)
+        y = self.c_proj(y)
+        return y
+
+
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = F.relu(x).square()
+        x = self.c_proj(x)
+        return x
+
+
+class Block(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.attn = CausalSelfAttention(config, layer_idx)
+        self.mlp = MLP(config)
+
+    def forward(self, x, ve, cos_sin, window_size):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size)
+        x = x + self.mlp(norm(x))
+        return x
+
+
+# ============================================================================
+# KV-cache compressor zoo
+# ----------------------------------------------------------------------------
+# Each compressor implements (compress, decompress) with a strict honest
+# byte-accounting contract: n_bytes returned by compress() must equal the
+# real storage cost of `state` (sum of tensor numel * element_size, plus any
+# scalar metadata). Compression is invoked inside the attention forward
+# (between RoPE+norm and SDPA) so the K, V seen by softmax are the
+# post-roundtrip values, exactly as in real cache reuse.
+# ============================================================================
+
+class KVCompressor:
+    """Compresses K, V tensors at attention time.
+
+    The agent should subclass / rewrite this. The default is the IDENTITY
+    compressor (no compression) which serves as the baseline.
+
+    Contract:
+      - compress(k, v) returns (state, byte_count). `state` is whatever
+        representation you want (tensor, tuple, dict, ...). `byte_count` is
+        the actual storage cost in bytes.
+      - decompress(state) returns (k_out, v_out) usable by SDPA, with the
+        same shape as the inputs to compress() and dtype matching the rest
+        of the model (bf16 on MPS/CPU, bf16/fp16 on CUDA).
+    """
+    name = "identity"
+    # Set to True in subclasses that need post-rotary Q to score tokens
+    # (e.g. H2O heavy-hitter eviction). Such compressors get q passed via kwarg.
+    needs_q = False
+
+    def __init__(self, config):
+        self.config = config
+
+    def compress(self, k, v):
+        # k, v: [B, T, n_kv_head, head_dim]
+        n_bytes = k.numel() * k.element_size() + v.numel() * v.element_size()
+        return (k, v), n_bytes
+
+    def decompress(self, state):
+        k, v = state
+        return k, v
+
+
+class INT8SymPerTokPerHeadCompressor(KVCompressor):
+    """INT8 symmetric per-(token,head) quantization of K and V.
+
+    Each (B, T, H) slice along head_dim is quantized with its own bf16 scale,
+    no zero-point (symmetric). Storage:
+      int8 values: B*T*H*D bytes
+      bf16 scale:  B*T*H*2 bytes
+    Per token per layer: 2*(2*H*D + 2*H*2) = 4*H*D + 8*H bytes
+    For H=2, D=96: 768 (bf16 baseline) -> 392 (~1.96x ratio).
+    """
+    name = "int8_sym_per_tok_per_head"
+
+    def compress(self, k, v):
+        k_f = k.to(torch.float32)
+        v_f = v.to(torch.float32)
+        eps = 1e-8
+        k_scale = k_f.abs().amax(dim=-1, keepdim=True).clamp_min(eps) / 127.0
+        v_scale = v_f.abs().amax(dim=-1, keepdim=True).clamp_min(eps) / 127.0
+        k_q = (k_f / k_scale).round().clamp(-128, 127).to(torch.int8)
+        v_q = (v_f / v_scale).round().clamp(-128, 127).to(torch.int8)
+        k_scale_b = k_scale.to(torch.bfloat16)
+        v_scale_b = v_scale.to(torch.bfloat16)
+        n_bytes = (k_q.numel() * k_q.element_size()
+                   + v_q.numel() * v_q.element_size()
+                   + k_scale_b.numel() * k_scale_b.element_size()
+                   + v_scale_b.numel() * v_scale_b.element_size())
+        return (k_q, k_scale_b, v_q, v_scale_b), n_bytes
+
+    def decompress(self, state):
+        k_q, k_scale_b, v_q, v_scale_b = state
+        k = k_q.to(torch.bfloat16) * k_scale_b
+        v = v_q.to(torch.bfloat16) * v_scale_b
+        return k, v
+
+
+class INTNSymPerTokPerHeadCompressor(KVCompressor):
+    """Generic N-bit symmetric per-(token,head) quantization (N in {2,4,8}).
+
+    For N=4, two values pack into one int8 byte conceptually, but the byte
+    accounting is exact: data = ceil(numel * N / 8) bytes per K/V tensor.
+    The actual stored representation here uses int8 for simplicity (so the
+    runtime is not actually saving memory in the Python tensors), but
+    `n_bytes` reports the *true* packed cost — the canonical research
+    metric. This is the standard convention in INT4/INT2 KV-cache papers.
+    """
+    def __init__(self, config, n_bits=4):
+        super().__init__(config)
+        self.n_bits = n_bits
+        self.qmax = 2 ** (n_bits - 1) - 1
+        self.qmin = -(2 ** (n_bits - 1))
+        self.name = f"int{n_bits}_sym_per_tok_per_head"
+
+    def compress(self, k, v):
+        k_f = k.to(torch.float32)
+        v_f = v.to(torch.float32)
+        eps = 1e-8
+        k_scale = k_f.abs().amax(dim=-1, keepdim=True).clamp_min(eps) / self.qmax
+        v_scale = v_f.abs().amax(dim=-1, keepdim=True).clamp_min(eps) / self.qmax
+        k_q = (k_f / k_scale).round().clamp(self.qmin, self.qmax)
+        v_q = (v_f / v_scale).round().clamp(self.qmin, self.qmax)
+        k_scale_b = k_scale.to(torch.bfloat16)
+        v_scale_b = v_scale.to(torch.bfloat16)
+        # Honest byte accounting: data is N-bit packed
+        data_bytes = ((k_q.numel() + v_q.numel()) * self.n_bits + 7) // 8
+        scale_bytes = (k_scale_b.numel() + v_scale_b.numel()) * 2
+        n_bytes = data_bytes + scale_bytes
+        # Decompress now to bf16 for downstream attention
+        k_dec = (k_q * k_scale).to(torch.bfloat16)
+        v_dec = (v_q * v_scale).to(torch.bfloat16)
+        return (k_dec, v_dec), n_bytes
+
+    def decompress(self, state):
+        return state
+
+
+class INTNGroupCompressor(KVCompressor):
+    """N-bit symmetric quantization with group-wise scales along head_dim.
+
+    Each `group_size` channels share one scale. group_size <= head_dim.
+    For group_size=16 and head_dim=96, n_bits=4, H=2:
+      data: 96*4/8 = 48 bytes per (K|V, token, head) -> 192 bytes total per token
+      scales: (96/16)*2 = 12 bytes per (K|V, token, head) -> 48 bytes per token
+      total per K+V per token per layer: 240 bytes vs 768 baseline -> 3.2x
+    """
+    def __init__(self, config, n_bits=4, group_size=16):
+        super().__init__(config)
+        self.n_bits = n_bits
+        self.group_size = group_size
+        self.qmax = 2 ** (n_bits - 1) - 1
+        self.qmin = -(2 ** (n_bits - 1))
+        self.name = f"int{n_bits}_group{group_size}"
+
+    def _quant_grouped(self, x):
+        # x: [B, T, H, D] -> grouped along D
+        B, T, H, D = x.shape
+        assert D % self.group_size == 0, f"head_dim {D} not divisible by group_size {self.group_size}"
+        G = D // self.group_size
+        x_g = x.to(torch.float32).view(B, T, H, G, self.group_size)
+        eps = 1e-8
+        scale = x_g.abs().amax(dim=-1, keepdim=True).clamp_min(eps) / self.qmax  # [B,T,H,G,1]
+        q = (x_g / scale).round().clamp(self.qmin, self.qmax)
+        # Decompress immediately
+        x_dec = (q * scale).view(B, T, H, D).to(torch.bfloat16)
+        return x_dec, scale, q.numel()
+
+    def compress(self, k, v):
+        k_dec, k_scale, k_numel = self._quant_grouped(k)
+        v_dec, v_scale, v_numel = self._quant_grouped(v)
+        data_bytes = ((k_numel + v_numel) * self.n_bits + 7) // 8
+        scale_bytes = (k_scale.numel() + v_scale.numel()) * 2  # bf16 scales
+        n_bytes = data_bytes + scale_bytes
+        return (k_dec, v_dec), n_bytes
+
+    def decompress(self, state):
+        return state
+
+
+class LowRankCompressor(KVCompressor):
+    """Per-(token,head) low-rank approximation of K, V via truncated SVD.
+
+    Each [B,T,H,D] tensor — for each (B,T,H) slice we have a vector of length D.
+    Per-vector "low-rank" doesn't reduce parameters (it IS the vector).
+    So we instead pool ACROSS heads: concatenate H heads into one [H*D] vector
+    per (B,T) and approximate that with rank r in a learned-free manner via
+    a fixed random Gaussian projection (Johnson-Lindenstrauss).
+
+    Storage: r floats (bf16) per (B, T) per layer, instead of H*D.
+    Compression ratio (K and V combined): (4*H*D) / (4*r) = H*D/r approximately.
+    """
+    def __init__(self, config, rank=32):
+        super().__init__(config)
+        self.rank = rank
+        head_dim = config.n_embd // config.n_head
+        self.name = f"randproj_rank{rank}"
+        # Fixed random projection (init-time, deterministic seed)
+        self._proj = None  # set on first call when device is known
+        self._d_full = config.n_kv_head * head_dim
+
+    def _get_proj(self, device, dtype):
+        if self._proj is None:
+            g = torch.Generator(device="cpu").manual_seed(1337)
+            P = torch.randn(self._d_full, self.rank, generator=g) / (self.rank ** 0.5)
+            self._proj = P.to(device=device, dtype=dtype)
+        return self._proj
+
+    def _project(self, x):
+        # x: [B, T, H, D] -> flatten heads -> project to rank -> back-project
+        B, T, H, D = x.shape
+        x_flat = x.reshape(B, T, H * D)
+        P = self._get_proj(x.device, x.dtype)
+        # Compress: y = x_flat @ P, shape [B, T, r]
+        y = x_flat @ P
+        # Decompress: x_hat = y @ P.T (since P is approximately orthonormal cols)
+        x_hat = y @ P.T
+        return x_hat.reshape(B, T, H, D), y
+
+    def compress(self, k, v):
+        k_hat, k_proj = self._project(k)
+        v_hat, v_proj = self._project(v)
+        # bf16 storage of the rank-r projection coefficients
+        n_bytes = (k_proj.numel() + v_proj.numel()) * 2
+        return (k_hat, v_hat), n_bytes
+
+    def decompress(self, state):
+        return state
+
+
+class SlidingWindowCompressor(KVCompressor):
+    """Keep only the last `window` tokens of K, V; drop everything older.
+
+    For positions older than `window`, we replace K, V with zeros at attention
+    time (which is equivalent to "no contribution" to softmax, modulo the
+    implicit -inf score for excluded positions). Storage: 0 bytes for old
+    tokens, full bf16 for tokens within the window.
+    """
+    def __init__(self, config, window=128):
+        super().__init__(config)
+        self.window = window
+        self.name = f"sliding_window_{window}"
+
+    def compress(self, k, v):
+        # k, v: [B, T, H, D] bf16
+        B, T, H, D = k.shape
+        if T <= self.window:
+            n_bytes = (k.numel() + v.numel()) * 2
+            return (k, v), n_bytes
+        # Zero out positions outside the recent window
+        k_keep = k.clone()
+        v_keep = v.clone()
+        cutoff = T - self.window
+        k_keep[:, :cutoff].zero_()
+        v_keep[:, :cutoff].zero_()
+        # Bytes: only the kept tokens count (zeros aren't stored in real cache)
+        n_bytes = (B * self.window * H * D * 2) * 2  # K and V
+        return (k_keep, v_keep), n_bytes
+
+    def decompress(self, state):
+        return state
+
+
+class HybridRecentFullOldQuantCompressor(KVCompressor):
+    """Recent tokens kept in bf16; older tokens INT4 quantized.
+
+    Combines two ideas: full quality for the most recent `recent` tokens
+    (which dominate attention in many tasks) and aggressive INT4 quant for
+    older tokens (where small errors are diluted in the softmax).
+    """
+    def __init__(self, config, recent=64, n_bits_old=4):
+        super().__init__(config)
+        self.recent = recent
+        self.n_bits = n_bits_old
+        self.qmax = 2 ** (n_bits_old - 1) - 1
+        self.qmin = -(2 ** (n_bits_old - 1))
+        self.name = f"hybrid_recent{recent}_int{n_bits_old}_old"
+
+    def _quant_old(self, x_old):
+        # symmetric per-(token,head) quant
+        x_f = x_old.to(torch.float32)
+        eps = 1e-8
+        scale = x_f.abs().amax(dim=-1, keepdim=True).clamp_min(eps) / self.qmax
+        q = (x_f / scale).round().clamp(self.qmin, self.qmax)
+        x_dec = (q * scale).to(torch.bfloat16)
+        return x_dec, q.numel(), scale.numel()
+
+    def compress(self, k, v):
+        B, T, H, D = k.shape
+        if T <= self.recent:
+            n_bytes = (k.numel() + v.numel()) * 2
+            return (k, v), n_bytes
+        cutoff = T - self.recent
+        k_old, k_new = k[:, :cutoff], k[:, cutoff:]
+        v_old, v_new = v[:, :cutoff], v[:, cutoff:]
+        k_old_dec, kq_n, ks_n = self._quant_old(k_old)
+        v_old_dec, vq_n, vs_n = self._quant_old(v_old)
+        k_full = torch.cat([k_old_dec, k_new], dim=1)
+        v_full = torch.cat([v_old_dec, v_new], dim=1)
+        # Bytes: recent in bf16 + old quantized
+        recent_bytes = (k_new.numel() + v_new.numel()) * 2
+        old_data_bytes = ((kq_n + vq_n) * self.n_bits + 7) // 8
+        old_scale_bytes = (ks_n + vs_n) * 2  # bf16 scales
+        n_bytes = recent_bytes + old_data_bytes + old_scale_bytes
+        return (k_full, v_full), n_bytes
+
+    def decompress(self, state):
+        return state
+
+
+class AsymINTNCompressor(KVCompressor):
+    """Asymmetric N-bit per-(token,head) quantization with zero-point.
+    Storage adds a per-(B,T,H) zero-point in bf16.
+    """
+    def __init__(self, config, n_bits=4):
+        super().__init__(config)
+        self.n_bits = n_bits
+        self.qmax = 2 ** n_bits - 1
+        self.name = f"int{n_bits}_asym_per_tok_per_head"
+
+    def _quant_asym(self, x):
+        x_f = x.to(torch.float32)
+        x_min = x_f.amin(dim=-1, keepdim=True)
+        x_max = x_f.amax(dim=-1, keepdim=True)
+        scale = (x_max - x_min).clamp_min(1e-8) / self.qmax
+        zero = x_min
+        q = ((x_f - zero) / scale).round().clamp(0, self.qmax)
+        x_dec = (q * scale + zero).to(torch.bfloat16)
+        return x_dec, q.numel(), scale.numel(), zero.numel()
+
+    def compress(self, k, v):
+        k_dec, kq_n, ks_n, kz_n = self._quant_asym(k)
+        v_dec, vq_n, vs_n, vz_n = self._quant_asym(v)
+        data_bytes = ((kq_n + vq_n) * self.n_bits + 7) // 8
+        scale_bytes = (ks_n + vs_n) * 2
+        zero_bytes = (kz_n + vz_n) * 2
+        n_bytes = data_bytes + scale_bytes + zero_bytes
+        return (k_dec, v_dec), n_bytes
+
+    def decompress(self, state):
+        return state
+
+
+class KHigherPrecVLowerPrecCompressor(KVCompressor):
+    """Mixed-precision: K kept at higher bit-width than V (or vice versa).
+    Hypothesis: K (used as similarity reference) may need more precision
+    than V (which is just being averaged over).
+    """
+    def __init__(self, config, k_bits=8, v_bits=4):
+        super().__init__(config)
+        self.k_bits = k_bits
+        self.v_bits = v_bits
+        self.k_max = 2 ** (k_bits - 1) - 1
+        self.k_min = -(2 ** (k_bits - 1))
+        self.v_max = 2 ** (v_bits - 1) - 1
+        self.v_min = -(2 ** (v_bits - 1))
+        self.name = f"mixed_K{k_bits}_V{v_bits}"
+
+    def _q(self, x, qmax, qmin):
+        x_f = x.to(torch.float32)
+        scale = x_f.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / qmax
+        q = (x_f / scale).round().clamp(qmin, qmax)
+        x_dec = (q * scale).to(torch.bfloat16)
+        return x_dec, q.numel(), scale.numel()
+
+    def compress(self, k, v):
+        k_dec, kq_n, ks_n = self._q(k, self.k_max, self.k_min)
+        v_dec, vq_n, vs_n = self._q(v, self.v_max, self.v_min)
+        n_bytes = ((kq_n * self.k_bits + 7) // 8 +
+                   (vq_n * self.v_bits + 7) // 8 +
+                   (ks_n + vs_n) * 2)
+        return (k_dec, v_dec), n_bytes
+
+    def decompress(self, state):
+        return state
+
+
+# ---- Eviction-family compressors ----
+# NOTE on "soft eviction" (limitation, documented in paper):
+# The compression hook receives K, V tensors and must return same-shape K_hat, V_hat;
+# we cannot mutate the SDPA mask. Eviction is therefore approximated by zeroing out
+# K and V at evicted positions. Softmax then assigns those positions a small leaked
+# weight (because q·0 = 0, while kept positions typically have larger scores), but
+# they contribute nothing to the output (since V=0). This slightly over-estimates
+# the quality cost vs true masked-attention eviction; we discuss this in §5
+# (Limitations) and confirm it does not flip any leaderboard ordering.
+
+class SinkPlusWindowCompressor(KVCompressor):
+    """StreamingLLM-style: keep the first `sinks` tokens (attention sinks)
+    plus the last `window` tokens; zero out everything in between."""
+    def __init__(self, config, sinks=4, window=128):
+        super().__init__(config)
+        self.sinks = sinks
+        self.window = window
+        self.name = f"sink{sinks}_W{window}"
+
+    def compress(self, k, v):
+        B, T, H, D = k.shape
+        kept = self.sinks + self.window
+        if T <= kept:
+            n_bytes = (k.numel() + v.numel()) * 2
+            return (k, v), n_bytes
+        k_keep = k.clone()
+        v_keep = v.clone()
+        # Zero positions [sinks, T-window) i.e. the middle band
+        k_keep[:, self.sinks:T - self.window].zero_()
+        v_keep[:, self.sinks:T - self.window].zero_()
+        # Honest bytes: only kept tokens stored
+        n_bytes = (B * kept * H * D * 2) * 2  # K and V, BF16
+        return (k_keep, v_keep), n_bytes
+
+    def decompress(self, state):
+        return state
+
+
+class TopKByKNormCompressor(KVCompressor):
+    """Keep the top-k tokens by ‖K‖₂ (summed over heads); zero the rest.
+    `k_frac` ∈ (0, 1] controls fraction of T retained.
+    Storage adds ⌈log₂ T⌉ bits of position index per kept token (recorded
+    in n_bytes so byte accounting is honest)."""
+    def __init__(self, config, k_frac=0.5):
+        super().__init__(config)
+        self.k_frac = k_frac
+        self.name = f"topk_knorm_{int(round(k_frac*100))}pct"
+
+    def compress(self, k, v):
+        B, T, H, D = k.shape
+        keep = max(1, int(self.k_frac * T))
+        if keep >= T:
+            n_bytes = (k.numel() + v.numel()) * 2
+            return (k, v), n_bytes
+        k_norm = k.float().norm(dim=(-2, -1))  # [B, T] — pooled across heads
+        _, top_idx = torch.topk(k_norm, keep, dim=1)
+        mask = torch.zeros(B, T, dtype=torch.bool, device=k.device)
+        mask.scatter_(1, top_idx, True)
+        keep_mask = mask[:, :, None, None]
+        k_keep = k * keep_mask
+        v_keep = v * keep_mask
+        idx_bits = max(1, (T - 1).bit_length())
+        idx_bytes_total = (B * keep * idx_bits + 7) // 8
+        n_bytes = (B * keep * H * D * 2) * 2 + idx_bytes_total
+        return (k_keep, v_keep), n_bytes
+
+    def decompress(self, state):
+        return state
+
+
+class H2OCompressor(KVCompressor):
+    """H2O ("Heavy Hitter Oracle") eviction (Zhang et al., 2023):
+    keep the last `recent` tokens plus the top-(keep_frac × (T-recent))
+    older tokens by total attention received from all causal queries.
+
+    Heavy-hitter score for key position j:
+        score[j] = Σ_{i ≥ j}  softmax_{j' ≤ i}( q_i · k_{j'} / √d )[j]
+    pooled across heads (sum) and computed once per batch in the eval pass.
+    Eviction is per-position (same indices kept across heads), since the KV
+    cache is laid out per-(batch, position).
+
+    GQA handling: queries are mean-pooled across each KV-head's group before
+    scoring (so attention is computed at the KV-head granularity).
+
+    Storage (matching topk_knorm pattern):
+      kept tokens × full bf16 K+V  +  ⌈log₂(T-recent)⌉ bits per heavy-hitter
+      (recent positions are positionally implicit; their indices are free).
+    """
+    needs_q = True
+
+    def __init__(self, config, recent=64, keep_frac=0.5):
+        super().__init__(config)
+        self.recent = recent
+        self.keep_frac = keep_frac
+        self.name = f"h2o_R{recent}_K{int(round(keep_frac*100))}pct"
+
+    def compress(self, k, v, q):
+        B, T, H, D = k.shape       # H = n_kv_head
+        Hq = q.shape[2]            # n_head
+        group = Hq // H
+        if T <= self.recent:
+            n_bytes = (k.numel() + v.numel()) * 2
+            return (k, v), n_bytes
+        cutoff = T - self.recent
+        keep_old = max(0, int(round(self.keep_frac * cutoff)))
+        keep_total = self.recent + keep_old
+        if keep_total >= T:
+            n_bytes = (k.numel() + v.numel()) * 2
+            return (k, v), n_bytes
+
+        # Pool queries down to KV-head granularity (GQA): mean over each group
+        q_pool = q.reshape(B, T, H, group, D).mean(dim=3)       # [B, T, H, D]
+
+        # Score in bf16 to save memory: O(B·H·T²) attention matrix.
+        scale = D ** -0.5
+        # qk[b,h,i,j] = q_pool[b,i,h,:] · k[b,j,h,:] / √d
+        qk = torch.einsum("bihd,bjhd->bhij", q_pool, k) * scale
+        causal = torch.ones(T, T, dtype=torch.bool, device=k.device).tril()
+        qk = qk.masked_fill(~causal[None, None], float("-inf"))
+        attn = torch.softmax(qk.float(), dim=-1)                # [B, H, T, T]
+        # Heavy-hitter score per (B, H, j) = Σ_i attn[i, j], pooled across heads
+        score = attn.sum(dim=2).sum(dim=1)                       # [B, T]
+        # Force-keep the recent window (will always survive top-k)
+        score[:, cutoff:] = float("inf")
+        _, top_idx = torch.topk(score, keep_total, dim=1)        # [B, keep_total]
+        mask = torch.zeros(B, T, dtype=torch.bool, device=k.device)
+        mask.scatter_(1, top_idx, True)
+        keep_mask = mask[:, :, None, None]
+        k_keep = k * keep_mask
+        v_keep = v * keep_mask
+
+        # Bytes: kept tokens × (K+V bf16) + position-index bits per heavy-hitter
+        idx_bits = max(1, (cutoff - 1).bit_length())
+        idx_bytes = (B * keep_old * idx_bits + 7) // 8
+        n_bytes = (B * keep_total * H * D * 2) * 2 + idx_bytes
+        return (k_keep, v_keep), n_bytes
+
+    def decompress(self, state):
+        return state
+
+
+class HeadPruneCompressor(KVCompressor):
+    """Drop the last `n_drop` KV heads entirely (zero their K,V).
+    Compute heads still GQA-replicate the surviving KV-head; pruned heads'
+    queries route to a zero K,V slice, contributing nothing post-softmax."""
+    def __init__(self, config, n_drop=1):
+        super().__init__(config)
+        self.n_drop = n_drop
+        self.n_kept = config.n_kv_head - n_drop
+        assert self.n_kept >= 1, f"Need ≥1 head, requested drop {n_drop} of {config.n_kv_head}"
+        self.name = f"headprune_{n_drop}of{config.n_kv_head}"
+
+    def compress(self, k, v):
+        B, T, H, D = k.shape
+        k_keep = k.clone()
+        v_keep = v.clone()
+        k_keep[:, :, H - self.n_drop:].zero_()
+        v_keep[:, :, H - self.n_drop:].zero_()
+        n_bytes = (B * T * self.n_kept * D * 2) * 2  # K and V, BF16, only kept heads
+        return (k_keep, v_keep), n_bytes
+
+    def decompress(self, state):
+        return state
+
+
+# ---- Low-rank family ----
+
+class SVDLowRankCompressor(KVCompressor):
+    """Per-token rank-r approximation via a frozen SVD-derived projection.
+    The projection P ∈ R^{H·D × r} is calibrated *once* from the right
+    singular vectors of the first batch's K (or V) matrix, then reused.
+    Storage per token: r BF16 floats per K, per V → 4·r bytes total.
+    Compression ratio versus identity (4·H·D bytes/token-layer) is H·D/r.
+    """
+    def __init__(self, config, rank=16):
+        super().__init__(config)
+        self.rank = rank
+        head_dim = config.n_embd // config.n_head
+        self._d_full = config.n_kv_head * head_dim
+        self.name = f"svd_r{rank}"
+        self._P_k = None
+        self._P_v = None
+
+    def _calibrate(self, x):
+        with torch.no_grad():
+            B, T, H, D = x.shape
+            X = x.reshape(B * T, H * D).float()
+            if X.size(0) > 4096:
+                idx = torch.randperm(X.size(0), device=X.device)[:4096]
+                X = X[idx]
+            _, _, Vh = torch.linalg.svd(X, full_matrices=False)
+            P = Vh[:self.rank].T.contiguous().to(x.dtype)  # [H·D, rank]
+        return P
+
+    def _project(self, x, P):
+        B, T, H, D = x.shape
+        x_flat = x.reshape(B, T, H * D)
+        y = x_flat @ P
+        x_hat = y @ P.T
+        return x_hat.reshape(B, T, H, D), y
+
+    def compress(self, k, v):
+        if self._P_k is None:
+            self._P_k = self._calibrate(k)
+            self._P_v = self._calibrate(v)
+        k_hat, k_proj = self._project(k, self._P_k)
+        v_hat, v_proj = self._project(v, self._P_v)
+        n_bytes = (k_proj.numel() + v_proj.numel()) * 2  # bf16 floats
+        return (k_hat, v_hat), n_bytes
+
+    def decompress(self, state):
+        return state
+
+
+# ---- Hybrid stacks ----
+
+class StackedCompressor(KVCompressor):
+    """Compose outer (eviction-style) ∘ inner (quant-style):
+       1) outer.compress(K, V) zeros out evicted positions/heads
+       2) inner.compress applied to surviving positions
+    Honest byte accounting: actual storage is inner_per_token × kept_fraction,
+    where kept_fraction = outer_bytes / full_bf16_bytes.
+    """
+    def __init__(self, config, outer, inner):
+        super().__init__(config)
+        self.outer = outer
+        self.inner = inner
+        self.name = f"stack_{outer.name}+{inner.name}"
+        # Stack needs q from the hook iff either side needs q (H2O outer or
+        # — hypothetically — a future q-using inner).
+        self.needs_q = getattr(outer, "needs_q", False) or getattr(inner, "needs_q", False)
+
+    def compress(self, k, v, q=None):
+        if getattr(self.outer, "needs_q", False):
+            outer_state, outer_bytes = self.outer.compress(k, v, q=q)
+        else:
+            outer_state, outer_bytes = self.outer.compress(k, v)
+        k1, v1 = self.outer.decompress(outer_state)
+        if getattr(self.inner, "needs_q", False):
+            inner_state, inner_full_bytes = self.inner.compress(k1, v1, q=q)
+        else:
+            inner_state, inner_full_bytes = self.inner.compress(k1, v1)
+        k2, v2 = self.inner.decompress(inner_state)
+        full_bf16_bytes = (k.numel() + v.numel()) * 2
+        kept_fraction = outer_bytes / full_bf16_bytes if full_bf16_bytes > 0 else 1.0
+        n_bytes = max(1, int(round(inner_full_bytes * kept_fraction)))
+        return (k2, v2), n_bytes
+
+    def decompress(self, state):
+        return state
+
+
+def pick_compressor(name, config):
+    """Resolve a string name into a compressor instance.
+    Naming scheme:
+      identity
+      int{N}                       e.g. int8, int4, int2
+      int{N}_g{G}                  e.g. int4_g16
+      int{N}_asym                  e.g. int4_asym
+      mixed_K{Nk}_V{Nv}            e.g. mixed_K8_V4
+      hybrid_R{recent}_int{Nold}   e.g. hybrid_R64_int2
+      sliding_W{W}                 e.g. sliding_W128
+      sink{S}_W{W}                 e.g. sink4_W128
+      topk_knorm_{P}pct            e.g. topk_knorm_50pct
+      h2o_R{recent}_K{P}pct        e.g. h2o_R64_K50pct
+      svd_r{R}                     e.g. svd_r16
+      randproj_r{R}                e.g. randproj_r32
+      headprune_{K}                e.g. headprune_1
+      stack:OUTER+INNER            e.g. stack:sliding_W128+int4
+    """
+    if name == "identity":
+        return KVCompressor(config)
+    if name.startswith("int") and "_g" in name:
+        n_bits, _, gtail = name[3:].partition("_g")
+        return INTNGroupCompressor(config, n_bits=int(n_bits), group_size=int(gtail))
+    if name.startswith("int") and name.endswith("_asym"):
+        n_bits = int(name[3:-5])
+        return AsymINTNCompressor(config, n_bits=n_bits)
+    if name.startswith("int") and name[3:].isdigit():
+        n_bits = int(name[3:])
+        if n_bits == 8:
+            return INT8SymPerTokPerHeadCompressor(config)
+        return INTNSymPerTokPerHeadCompressor(config, n_bits=n_bits)
+    if name.startswith("mixed_K"):
+        # mixed_K{k}_V{v}
+        rest = name[len("mixed_K"):]
+        k_bits_str, _, v_part = rest.partition("_V")
+        return KHigherPrecVLowerPrecCompressor(config, k_bits=int(k_bits_str), v_bits=int(v_part))
+    if name.startswith("hybrid_R"):
+        # hybrid_R{recent}_int{n}
+        rest = name[len("hybrid_R"):]
+        recent_str, _, intpart = rest.partition("_int")
+        return HybridRecentFullOldQuantCompressor(config, recent=int(recent_str), n_bits_old=int(intpart))
+    if name.startswith("sliding_W"):
+        return SlidingWindowCompressor(config, window=int(name[len("sliding_W"):]))
+    if name.startswith("sink"):
+        # sink{S}_W{W}
+        rest = name[len("sink"):]
+        s_str, _, w_part = rest.partition("_W")
+        return SinkPlusWindowCompressor(config, sinks=int(s_str), window=int(w_part))
+    if name.startswith("topk_knorm_"):
+        pct_str = name[len("topk_knorm_"):].rstrip("pct")
+        return TopKByKNormCompressor(config, k_frac=int(pct_str) / 100.0)
+    if name.startswith("h2o_R"):
+        # h2o_R{recent}_K{P}pct
+        rest = name[len("h2o_R"):]
+        recent_str, _, k_part = rest.partition("_K")
+        pct_str = k_part.rstrip("pct")
+        return H2OCompressor(config, recent=int(recent_str), keep_frac=int(pct_str) / 100.0)
+    if name.startswith("svd_r"):
+        return SVDLowRankCompressor(config, rank=int(name[len("svd_r"):]))
+    if name.startswith("randproj_r"):
+        return LowRankCompressor(config, rank=int(name[len("randproj_r"):]))
+    if name.startswith("headprune_"):
+        return HeadPruneCompressor(config, n_drop=int(name[len("headprune_"):]))
+    if name.startswith("stack:"):
+        outer_name, _, inner_name = name[len("stack:"):].partition("+")
+        return StackedCompressor(config, pick_compressor(outer_name, config),
+                                 pick_compressor(inner_name, config))
+    raise ValueError(f"Unknown compressor name: {name}")
+
+
+# Holds the active compressor during compression eval. Set by the eval driver.
+_ACTIVE_COMPRESSOR = None
+_TOTAL_COMPRESSED_BYTES = 0
+_TOTAL_TOKENS_SEEN = 0
+
+
+def _attention_forward_with_compression(self, x, ve, cos_sin, window_size):
+    """Replacement for CausalSelfAttention.forward that routes K, V through
+    _ACTIVE_COMPRESSOR. Wired in only during compression eval."""
+    global _TOTAL_COMPRESSED_BYTES, _TOTAL_TOKENS_SEEN
+    B, T, C = x.size()
+    q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+    k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+    v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+
+    if ve is not None:
+        ve = ve.view(B, T, self.n_kv_head, self.head_dim)
+        gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
+        v = v + gate.unsqueeze(-1) * ve
+
+    cos, sin = cos_sin
+    q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+    q, k = norm(q), norm(k)
+
+    # *** COMPRESSION HOOK ***
+    if _ACTIVE_COMPRESSOR is not None:
+        if getattr(_ACTIVE_COMPRESSOR, "needs_q", False):
+            state, n_bytes = _ACTIVE_COMPRESSOR.compress(k, v, q=q)
+        else:
+            state, n_bytes = _ACTIVE_COMPRESSOR.compress(k, v)
+        k, v = _ACTIVE_COMPRESSOR.decompress(state)
+        _TOTAL_COMPRESSED_BYTES += n_bytes
+        _TOTAL_TOKENS_SEEN += B * T
+
+    k = k.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
+    v = v.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+
+    window = window_size[0]
+    if window > 0 and window < T:
+        mask = torch.ones(T, T, dtype=torch.bool, device=q.device).tril()
+        mask = mask.triu(diagonal=1 - window)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+    else:
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+    y = y.transpose(1, 2).contiguous().view(B, T, -1)
+    y = self.c_proj(y)
+    return y
+
+
+def fast_evaluate_bpb(model, tokenizer, batch_size, eval_tokens=4 * 524288):
+    """Like prepare.evaluate_bpb but with a configurable, smaller token count.
+    Used for the compression evals so we can run many experiments per hour."""
+    import math
+    from prepare import MAX_SEQ_LEN, get_token_bytes, make_dataloader
+    device = next(model.parameters()).device
+    token_bytes = get_token_bytes(device=device)
+    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
+    steps = max(1, eval_tokens // (batch_size * MAX_SEQ_LEN))
+    total_nats = 0.0
+    total_bytes = 0
+    for _ in range(steps):
+        x, y, _ = next(val_loader)
+        loss_flat = model(x, y, reduction='none').view(-1)
+        y_flat = y.view(-1)
+        nbytes = token_bytes[y_flat]
+        mask = nbytes > 0
+        total_nats += (loss_flat * mask).sum().item()
+        total_bytes += nbytes.sum().item()
+    return total_nats / (math.log(2) * total_bytes)
+
+
+def evaluate_with_compressor(model, tokenizer, batch_size, compressor, eval_tokens=4 * 524288):
+    """Returns (val_bpb, bytes_per_token_per_layer) under the given compressor."""
+    global _ACTIVE_COMPRESSOR, _TOTAL_COMPRESSED_BYTES, _TOTAL_TOKENS_SEEN
+    _ACTIVE_COMPRESSOR = compressor
+    _TOTAL_COMPRESSED_BYTES = 0
+    _TOTAL_TOKENS_SEEN = 0
+
+    # Monkey-patch all attention forwards to use the compression hook
+    original_forwards = []
+    for block in model.transformer.h:
+        original_forwards.append(block.attn.forward)
+        block.attn.forward = _attention_forward_with_compression.__get__(
+            block.attn, CausalSelfAttention)
+    try:
+        bpb = fast_evaluate_bpb(model, tokenizer, batch_size, eval_tokens=eval_tokens)
+    finally:
+        # Restore
+        for block, fwd in zip(model.transformer.h, original_forwards):
+            block.attn.forward = fwd
+        _ACTIVE_COMPRESSOR = None
+
+    # _TOTAL_TOKENS_SEEN was incremented once per (forward, layer); so it already
+    # equals (n_layer * batches * B * T). Hence dividing _TOTAL_COMPRESSED_BYTES
+    # by it gives bytes per (token, layer) directly.
+    if _TOTAL_TOKENS_SEEN > 0:
+        bytes_per_token_per_layer = _TOTAL_COMPRESSED_BYTES / _TOTAL_TOKENS_SEEN
+    else:
+        bytes_per_token_per_layer = 0.0
+    return bpb, bytes_per_token_per_layer
+
+
+# ============================================================================
+# end compressor zoo
+# ============================================================================
+
+
+class GPT(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.window_sizes = self._compute_window_sizes(config)
+        self.transformer = nn.ModuleDict({
+            "wte": nn.Embedding(config.vocab_size, config.n_embd),
+            "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
+        })
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
+        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
+        # Value embeddings
+        head_dim = config.n_embd // config.n_head
+        kv_dim = config.n_kv_head * head_dim
+        self.value_embeds = nn.ModuleDict({
+            str(i): nn.Embedding(config.vocab_size, kv_dim)
+            for i in range(config.n_layer) if has_ve(i, config.n_layer)
+        })
+        # Rotary embeddings
+        self.rotary_seq_len = config.sequence_len * 10
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
+
+    @torch.no_grad()
+    def init_weights(self):
+        # Embedding and unembedding
+        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
+        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        # Transformer blocks
+        n_embd = self.config.n_embd
+        s = 3**0.5 * n_embd**-0.5
+        for block in self.transformer.h:
+            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
+            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+            torch.nn.init.zeros_(block.attn.c_proj.weight)
+            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+        # Per-layer scalars
+        self.resid_lambdas.fill_(1.0)
+        self.x0_lambdas.fill_(0.1)
+        # Value embeddings
+        for ve in self.value_embeds.values():
+            torch.nn.init.uniform_(ve.weight, -s, s)
+        # Gate weights init to zero (sigmoid(0)=0.5, scaled by 2 -> 1.0 = neutral)
+        for block in self.transformer.h:
+            if block.attn.ve_gate is not None:
+                torch.nn.init.zeros_(block.attn.ve_gate.weight)
+        # Rotary embeddings
+        head_dim = self.config.n_embd // self.config.n_head
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        self.cos, self.sin = cos, sin
+        # Cast embeddings to bf16
+        self.transformer.wte.to(dtype=torch.bfloat16)
+        for ve in self.value_embeds.values():
+            ve.to(dtype=torch.bfloat16)
+
+    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
+        if device is None:
+            device = self.transformer.wte.weight.device
+        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
+        inv_freq = 1.0 / (base ** (channel_range / head_dim))
+        t = torch.arange(seq_len, dtype=torch.float32, device=device)
+        freqs = torch.outer(t, inv_freq)
+        cos, sin = freqs.cos(), freqs.sin()
+        cos, sin = cos.bfloat16(), sin.bfloat16()
+        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+        return cos, sin
+
+    def _compute_window_sizes(self, config):
+        pattern = config.window_pattern.upper()
+        assert all(c in "SL" for c in pattern)
+        long_window = config.sequence_len
+        short_window = long_window // 2
+        char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
+        window_sizes = []
+        for layer_idx in range(config.n_layer):
+            char = pattern[layer_idx % len(pattern)]
+            window_sizes.append(char_to_window[char])
+        window_sizes[-1] = (long_window, 0)
+        return window_sizes
+
+    def estimate_flops(self):
+        """Estimated FLOPs per token (forward + backward)."""
+        nparams = sum(p.numel() for p in self.parameters())
+        value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
+        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
+                          self.resid_lambdas.numel() + self.x0_lambdas.numel())
+        h = self.config.n_head
+        q = self.config.n_embd // self.config.n_head
+        t = self.config.sequence_len
+        attn_flops = 0
+        for window_size in self.window_sizes:
+            window = window_size[0]
+            effective_seq = t if window < 0 else min(window, t)
+            attn_flops += 12 * h * q * effective_seq
+        return 6 * (nparams - nparams_exclude) + attn_flops
+
+    def num_scaling_params(self):
+        wte = sum(p.numel() for p in self.transformer.wte.parameters())
+        value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
+        lm_head = sum(p.numel() for p in self.lm_head.parameters())
+        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
+        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        return {
+            'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head,
+            'transformer_matrices': transformer_matrices, 'scalars': scalars, 'total': total,
+        }
+
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
+                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+        model_dim = self.config.n_embd
+        matrix_params = list(self.transformer.h.parameters())
+        value_embeds_params = list(self.value_embeds.parameters())
+        embedding_params = list(self.transformer.wte.parameters())
+        lm_head_params = list(self.lm_head.parameters())
+        resid_params = [self.resid_lambdas]
+        x0_params = [self.x0_lambdas]
+        assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
+            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
+        # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
+        dmodel_lr_scale = (model_dim / 768) ** -0.5
+        print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
+        param_groups = [
+            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+        ]
+        for shape in sorted({p.shape for p in matrix_params}):
+            group_params = [p for p in matrix_params if p.shape == shape]
+            param_groups.append(dict(
+                kind='muon', params=group_params, lr=matrix_lr,
+                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+            ))
+        optimizer = MuonAdamW(param_groups)
+        for group in optimizer.param_groups:
+            group["initial_lr"] = group["lr"]
+        return optimizer
+
+    def forward(self, idx, targets=None, reduction='mean'):
+        B, T = idx.size()
+        assert T <= self.cos.size(1)
+        cos_sin = self.cos[:, :T], self.sin[:, :T]
+
+        x = self.transformer.wte(idx)
+        x = norm(x)
+        x0 = x
+        for i, block in enumerate(self.transformer.h):
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+            x = block(x, ve, cos_sin, self.window_sizes[i])
+        x = norm(x)
+
+        softcap = 15
+        logits = self.lm_head(x)
+        logits = logits.float()
+        logits = softcap * torch.tanh(logits / softcap)
+
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
+                                   ignore_index=-1, reduction=reduction)
+            return loss
+        return logits
+
+# ---------------------------------------------------------------------------
+# Optimizer (MuonAdamW, single GPU only)
+# ---------------------------------------------------------------------------
+
+polar_express_coeffs = [
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
+]
+
+
+def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
+    # Move scalars to correct device and dtype
+    step_t = step_t.to(device=p.device, dtype=p.dtype)
+    lr_t = lr_t.to(device=p.device, dtype=p.dtype)
+    beta1_t = beta1_t.to(device=p.device, dtype=p.dtype)
+    beta2_t = beta2_t.to(device=p.device, dtype=p.dtype)
+    eps_t = eps_t.to(device=p.device, dtype=p.dtype)
+    wd_t = wd_t.to(device=p.device, dtype=p.dtype)
+    
+    p.mul_(1 - lr_t * wd_t)
+    exp_avg.lerp_(grad, 1 - beta1_t)
+    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
+    bias1 = 1 - beta1_t ** step_t
+    bias2 = 1 - beta2_t ** step_t
+    denom = (exp_avg_sq / bias2).sqrt() + eps_t
+    step_size = lr_t / bias1
+    p.add_(exp_avg / denom, alpha=-step_size)
+
+
+def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
+                    momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
+    # Move scalars to correct device and dtype
+    momentum_t = momentum_t.to(device=stacked_params.device, dtype=stacked_params.dtype)
+    lr_t = lr_t.to(device=stacked_params.device, dtype=stacked_params.dtype)
+    wd_t = wd_t.to(device=stacked_params.device, dtype=stacked_params.dtype)
+    beta2_t = beta2_t.to(device=stacked_params.device, dtype=stacked_params.dtype)
+
+    # Nesterov momentum
+    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    g = stacked_grads.lerp_(momentum_buffer, momentum)
+    # Polar express orthogonalization
+    X = g.bfloat16()
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
+    if g.size(-2) > g.size(-1):
+        for a, b, c in polar_express_coeffs[:ns_steps]:
+            A = X.mT @ X
+            B = b * A + c * (A @ A)
+            X = a * X + X @ B
+    else:
+        for a, b, c in polar_express_coeffs[:ns_steps]:
+            A = X @ X.mT
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+    g = X
+    # NorMuon variance reduction
+    beta2 = beta2_t.to(g.dtype)
+    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
+    red_dim_size = g.size(red_dim)
+    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
+    v_norm = v_norm_sq.sqrt()
+    
+    # Needs to match second_momentum_buffer.dtype for lerp_
+    beta2_cast = beta2_t.to(second_momentum_buffer.dtype)
+    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2_cast)
+    
+    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
+    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
+    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
+    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
+    g = g * final_scale.to(g.dtype)
+    # Cautious weight decay + parameter update
+    lr = lr_t.to(g.dtype)
+    wd = wd_t.to(g.dtype)
+    mask = (g * stacked_params) >= 0
+    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+
+
+class MuonAdamW(torch.optim.Optimizer):
+    """Combined optimizer: Muon for 2D matrix params, AdamW for others."""
+
+    def __init__(self, param_groups):
+        super().__init__(param_groups, defaults={})
+        # 0-D CPU tensors to avoid torch.compile recompilation when values change
+        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        
+        # Compile conditionally
+        compiler_kwargs = {"dynamic": False, "fullgraph": True}
+        if device_type in ("cuda", "cpu"):
+            self.adamw_step_fused = torch.compile(adamw_step_fused, **compiler_kwargs)
+            self.muon_step_fused = torch.compile(muon_step_fused, **compiler_kwargs)
+        else:
+            self.adamw_step_fused = adamw_step_fused
+            self.muon_step_fused = muon_step_fused
+
+    def _step_adamw(self, group):
+        for p in group['params']:
+            if p.grad is None:
+                continue
+            grad = p.grad
+            state = self.state[p]
+            if not state:
+                state['step'] = 0
+                state['exp_avg'] = torch.zeros_like(p)
+                state['exp_avg_sq'] = torch.zeros_like(p)
+            state['step'] += 1
+            self._adamw_step_t.fill_(state['step'])
+            self._adamw_lr_t.fill_(group['lr'])
+            self._adamw_beta1_t.fill_(group['betas'][0])
+            self._adamw_beta2_t.fill_(group['betas'][1])
+            self._adamw_eps_t.fill_(group['eps'])
+            self._adamw_wd_t.fill_(group['weight_decay'])
+            self.adamw_step_fused(p, grad, state['exp_avg'], state['exp_avg_sq'],
+                            self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
+                            self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
+
+    def _step_muon(self, group):
+        params = group['params']
+        if not params:
+            return
+        p = params[0]
+        state = self.state[p]
+        num_params = len(params)
+        shape, device, dtype = p.shape, p.device, p.dtype
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
+        if "second_momentum_buffer" not in state:
+            state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
+            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
+        red_dim = -1 if shape[-2] >= shape[-1] else -2
+        stacked_grads = torch.stack([p.grad for p in params])
+        stacked_params = torch.stack(params)
+        self._muon_momentum_t.fill_(group["momentum"])
+        self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
+        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+        self._muon_wd_t.fill_(group["weight_decay"])
+        self.muon_step_fused(stacked_grads, stacked_params,
+                        state["momentum_buffer"], state["second_momentum_buffer"],
+                        self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
+                        self._muon_beta2_t, group["ns_steps"], red_dim)
+        torch._foreach_copy_(params, list(stacked_params.unbind(0)))
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            if group['kind'] == 'adamw':
+                self._step_adamw(group)
+            elif group['kind'] == 'muon':
+                self._step_muon(group)
+
+# ---------------------------------------------------------------------------
+# Hyperparameters (edit these directly, no CLI flags needed)
+# ---------------------------------------------------------------------------
+
+# Model architecture & training defaults — auto-scaled per device.
+#
+# The substrate is small but representative; on CUDA we scale up so eval
+# noise shrinks and the substrate is closer to "real" deployable models.
+# On MPS we stay small so Apple Silicon laptops don't crash. CUDA preset
+# is tuned for a single 24GB GPU (e.g. RunPod RTX 4090).
+HEAD_DIM = 96           # target head dimension for attention
+WINDOW_PATTERN = "L"    # sliding window pattern: L=full, S=half context
+
+# Optimization (shared across devices)
+EMBEDDING_LR = 0.8       # learning rate for token embeddings (Adam)
+UNEMBEDDING_LR = 0.005   # learning rate for lm_head (Adam)
+MATRIX_LR = 0.05         # learning rate for matrix parameters (Muon)
+SCALAR_LR = 0.6          # learning rate for per-layer scalars (Adam)
+WEIGHT_DECAY = 0.15      # cautious weight decay for Muon
+ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
+WARMUP_RATIO = 0.0       # fraction of time budget for LR warmup
+WARMDOWN_RATIO = 0.5     # fraction of time budget for LR warmdown
+FINAL_LR_FRAC = 0.0      # final LR as fraction of initial
+
+if DEVICE_TYPE == "cuda":
+    # 24GB-class GPU defaults: bigger substrate, larger batch.
+    ASPECT_RATIO     = 64
+    DEPTH            = 6
+    DEVICE_BATCH_SIZE = 16
+    TOTAL_BATCH_SIZE  = 2**17    # ~131K tokens / optimizer step
+else:
+    # Apple Silicon / CPU — small enough to fit in 8-16 GB unified memory.
+    ASPECT_RATIO     = 40
+    DEPTH            = 3
+    DEVICE_BATCH_SIZE = 4
+    TOTAL_BATCH_SIZE  = 2**14    # ~16K tokens / optimizer step
+
+# Env-var overrides for substrate-scale sweep and compressor selection.
+DEPTH         = int(os.environ.get("DEPTH", DEPTH))
+ASPECT_RATIO  = int(os.environ.get("ASPECT_RATIO", ASPECT_RATIO))
+DEVICE_BATCH_SIZE = int(os.environ.get("DEVICE_BATCH_SIZE", DEVICE_BATCH_SIZE))
+HEAD_DIM      = int(os.environ.get("HEAD_DIM", HEAD_DIM))
+COMPRESSOR_NAME = os.environ.get("COMPRESSOR", "hybrid_R64_int2")
+TRAIN_CACHE   = int(os.environ.get("TRAIN_CACHE", "1"))  # 1 = reuse cached model
+
+# ---------------------------------------------------------------------------
+# Setup: tokenizer, model, optimizer, dataloader
+# ---------------------------------------------------------------------------
+
+t_start = time.time()
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(42)
+torch.set_float32_matmul_precision("high")
+
+# Reuse the device picked by verify_env() at startup
+device_type = DEVICE_TYPE
+device = torch.device(device_type)
+
+# Autocast context
+if device_type == "cuda":
+    autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+elif device_type == "cpu":
+    autocast_ctx = torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16)
+else:
+    import contextlib
+    autocast_ctx = contextlib.nullcontext()
+
+H100_BF16_PEAK_FLOPS = 989.5e12
+
+tokenizer = Tokenizer.from_directory()
+vocab_size = tokenizer.get_vocab_size()
+print(f"Vocab size: {vocab_size:,}")
+
+def build_model_config(depth):
+    base_dim = depth * ASPECT_RATIO
+    model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
+    num_heads = model_dim // HEAD_DIM
+    return GPTConfig(
+        sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
+        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        window_pattern=WINDOW_PATTERN,
+    )
+
+config = build_model_config(DEPTH)
+print(f"Model config: {asdict(config)}")
+
+with torch.device("meta"):
+    model = GPT(config)
+model.to_empty(device=device)
+model.init_weights()
+
+param_counts = model.num_scaling_params()
+print("Parameter counts:")
+for key, value in param_counts.items():
+    print(f"  {key:24s}: {value:,}")
+num_params = param_counts['total']
+num_flops_per_token = model.estimate_flops()
+print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
+
+tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
+assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
+grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
+
+optimizer = model.setup_optimizer(
+    unembedding_lr=UNEMBEDDING_LR,
+    embedding_lr=EMBEDDING_LR,
+    scalar_lr=SCALAR_LR,
+    adam_betas=ADAM_BETAS,
+    matrix_lr=MATRIX_LR,
+    weight_decay=WEIGHT_DECAY,
+)
+
+# Try to load a cached trained model that matches this config. Compressor
+# experiments can reuse the same trained substrate, saving ~5 min/run.
+_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "kvcompress", "models")
+os.makedirs(_CACHE_DIR, exist_ok=True)
+_cfg_key = (f"d{config.n_layer}_a{ASPECT_RATIO}_h{HEAD_DIM}_t{TIME_BUDGET}"
+            f"_b{TOTAL_BATCH_SIZE}_v{config.vocab_size}_w{config.window_pattern}")
+_cache_path = os.path.join(_CACHE_DIR, f"model_{_cfg_key}.pt")
+
+cached_loaded = False
+cached_step = 0
+cached_train_time = 0.0
+if TRAIN_CACHE and os.path.exists(_cache_path):
+    print(f"Loading cached substrate model: {_cache_path}")
+    _state = torch.load(_cache_path, map_location=device, weights_only=True)
+    model.load_state_dict(_state["model"])
+    cached_step = int(_state.get("step", 0))
+    cached_train_time = float(_state.get("training_seconds", 0.0))
+    cached_loaded = True
+    print(f"  cached_step={cached_step}, cached_train_time={cached_train_time:.1f}s")
+
+# torch.compile is unstable on MPS, only use on CUDA
+if device_type == "cuda":
+    model = torch.compile(model, dynamic=False)
+
+train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+x, y, epoch = next(train_loader)  # prefetch first batch
+
+print(f"Time budget: {TIME_BUDGET}s")
+print(f"Gradient accumulation steps: {grad_accum_steps}")
+print(f"Compressor: {COMPRESSOR_NAME}")
+
+# Schedules (all based on progress = training_time / TIME_BUDGET)
+
+def get_lr_multiplier(progress):
+    if progress < WARMUP_RATIO:
+        return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
+    elif progress < 1.0 - WARMDOWN_RATIO:
+        return 1.0
+    else:
+        cooldown = (1.0 - progress) / WARMDOWN_RATIO
+        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
+
+def get_muon_momentum(step):
+    frac = min(step / 300, 1)
+    return (1 - frac) * 0.85 + frac * 0.95
+
+def get_weight_decay(progress):
+    return WEIGHT_DECAY * (1 - progress)
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+
+t_start_training = time.time()
+smooth_train_loss = 0
+total_training_time = 0
+step = 0
+
+def sync_device(device_type):
+    if device_type == "cuda":
+        torch.cuda.synchronize()
+    elif device_type == "mps":
+        torch.mps.synchronize()
+
+if cached_loaded:
+    print("Skipping training — using cached substrate.")
+    step = cached_step
+    total_training_time = cached_train_time
+    # Keep gc disabled like the trained path so eval timing is consistent
+    gc.collect()
+    gc.freeze()
+    gc.disable()
+
+while not cached_loaded:
+    sync_device(device_type)
+    t0 = time.time()
+    for micro_step in range(grad_accum_steps):
+        with autocast_ctx:
+            loss = model(x, y)
+        train_loss = loss.detach()
+        loss = loss / grad_accum_steps
+        loss.backward()
+        x, y, epoch = next(train_loader)
+
+    # Progress and schedules
+    progress = min(total_training_time / TIME_BUDGET, 1.0)
+    lrm = get_lr_multiplier(progress)
+    muon_momentum = get_muon_momentum(step)
+    muon_weight_decay = get_weight_decay(progress)
+    for group in optimizer.param_groups:
+        group["lr"] = group["initial_lr"] * lrm
+        if group['kind'] == 'muon':
+            group["momentum"] = muon_momentum
+            group["weight_decay"] = muon_weight_decay
+    optimizer.step()
+    model.zero_grad(set_to_none=True)
+
+    train_loss_f = train_loss.item()
+
+    # Fast fail: abort if loss is exploding
+    if train_loss_f > 100:
+        print("FAIL")
+        exit(1)
+
+    sync_device(device_type)
+    t1 = time.time()
+    dt = t1 - t0
+
+    if step > 10:
+        total_training_time += dt
+
+    # Logging
+    ema_beta = 0.9
+    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
+    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
+    pct_done = 100 * progress
+    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
+    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+    remaining = max(0, TIME_BUDGET - total_training_time)
+
+    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+
+    # GC management (Python's GC causes ~500ms stalls)
+    if step == 0:
+        gc.collect()
+        gc.freeze()
+        gc.disable()
+    elif (step + 1) % 5000 == 0:
+        gc.collect()
+
+    step += 1
+
+    # Time's up — but only stop after warmup steps so we don't count compilation
+    if step > 10 and total_training_time >= TIME_BUDGET:
+        break
+
+print()  # newline after \r training log
+
+# Save trained substrate to cache for subsequent compressor experiments
+if (not cached_loaded) and TRAIN_CACHE:
+    _orig = model._orig_mod if hasattr(model, "_orig_mod") else model
+    torch.save({
+        "model": _orig.state_dict(),
+        "step": step,
+        "training_seconds": total_training_time,
+        "config_key": _cfg_key,
+    }, _cache_path)
+    print(f"Saved substrate cache: {_cache_path}")
+
+total_tokens = max(step, 1) * TOTAL_BATCH_SIZE
+
+# Final eval
+model.eval()
+
+# 1) Baseline compression eval: identity compressor (uncompressed K,V).
+#    Cached once per substrate (depends only on model state) to save ~15s/run.
+_baseline_cache_path = os.path.join(_CACHE_DIR, f"baseline_{_cfg_key}.pt")
+if TRAIN_CACHE and cached_loaded and os.path.exists(_baseline_cache_path):
+    _b = torch.load(_baseline_cache_path, weights_only=True)
+    baseline_bpb = float(_b["bpb"])
+    baseline_bpt = float(_b["bpt"])
+    print(f"Loaded cached baseline: bpb={baseline_bpb:.6f} bpt={baseline_bpt:.2f}")
+else:
+    identity_compressor = KVCompressor(config)
+    with autocast_ctx:
+        baseline_bpb, baseline_bpt = evaluate_with_compressor(
+            model, tokenizer, DEVICE_BATCH_SIZE, identity_compressor)
+    if TRAIN_CACHE:
+        torch.save({"bpb": baseline_bpb, "bpt": baseline_bpt}, _baseline_cache_path)
+        print(f"Saved baseline cache: bpb={baseline_bpb:.6f} bpt={baseline_bpt:.2f}")
+val_bpb = baseline_bpb  # alias for backward-compat printing
+
+# 3) Agent's compression eval. Selected via env var COMPRESSOR (see pick_compressor).
+agent_compressor = pick_compressor(COMPRESSOR_NAME, config)
+with autocast_ctx:
+    compressed_bpb, compressed_bpt = evaluate_with_compressor(
+        model, tokenizer, DEVICE_BATCH_SIZE, agent_compressor)
+
+# Compression metrics
+compression_ratio = baseline_bpt / compressed_bpt if compressed_bpt > 0 else 0.0
+val_bpb_delta = compressed_bpb - baseline_bpb  # >0 = quality lost
+# Composite score (higher = better). Penalty α tunes quality vs ratio tradeoff.
+COMPRESSION_SCORE_ALPHA = float(os.environ.get("COMPRESSION_SCORE_ALPHA", "10.0"))
+def _score(alpha):
+    return compression_ratio - alpha * max(val_bpb_delta, 0.0)
+score_a10 = _score(10.0)
+score_a20 = _score(20.0)
+score_a50 = _score(50.0)
+compression_score = _score(COMPRESSION_SCORE_ALPHA)
+
+# Final summary
+t_end = time.time()
+startup_time = t_start_training - t_start
+steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+if device_type == "cuda":
+    peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+else:
+    peak_vram_mb = 0.0
+
+print("---")
+print(f"val_bpb:                {val_bpb:.6f}")
+print(f"baseline_bpb:           {baseline_bpb:.6f}")
+print(f"compressed_bpb:         {compressed_bpb:.6f}")
+print(f"val_bpb_delta:          {val_bpb_delta:.6f}")
+print(f"baseline_bytes_per_tok: {baseline_bpt:.2f}")
+print(f"compressed_bytes_per_tok: {compressed_bpt:.2f}")
+print(f"compression_ratio:      {compression_ratio:.4f}")
+print(f"compressor_name:        {agent_compressor.name}")
+print(f"compression_score:      {compression_score:.6f}")
+print(f"score_alpha10:          {score_a10:.6f}")
+print(f"score_alpha20:          {score_a20:.6f}")
+print(f"score_alpha50:          {score_a50:.6f}")
+print(f"training_seconds:       {total_training_time:.1f}")
+print(f"total_seconds:          {t_end - t_start:.1f}")
+print(f"peak_vram_mb:           {peak_vram_mb:.1f}")
+print(f"mfu_percent:            {steady_state_mfu:.2f}")
+print(f"total_tokens_M:         {total_tokens / 1e6:.1f}")
+print(f"num_steps:              {step}")
+print(f"num_params_M:           {num_params / 1e6:.1f}")
+print(f"depth:                  {DEPTH}")
+print(f"aspect_ratio:           {ASPECT_RATIO}")
+print(f"head_dim:               {HEAD_DIM}")
+print(f"n_kv_head:              {config.n_kv_head}")
