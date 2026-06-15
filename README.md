@@ -2,8 +2,7 @@
 
 A controlled, strict-byte-accounted Pareto comparison of KV-cache
 compressors (quantization, low-rank, eviction, hybrid) on small
-GPT-style transformer substrates, prepared for the **ICML 2026
-Workshop on Resource-Adaptive Foundation Models (AdaptFM)**.
+GPT-style transformer substrates.
 
 The empirical leaderboard with every experiment is in
 [`results.tsv`](results.tsv); generated figures are in
